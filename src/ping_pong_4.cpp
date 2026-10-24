@@ -25,11 +25,21 @@ const uint8_t BROADCAST[6] = {
 
 constexpr uint32_t MAGIC = 0x45535034;
 
+// =========================================
+// Push Button Configuration
+// Connect an external momentary push button between GPIO 4 and GND.
+// (Uses internal pull-up resistor, no external resistor required)
+// =========================================
+constexpr uint8_t BUTTON_PIN = 4;
+constexpr uint32_t BUTTON_SEND_INTERVAL = 500; // Repeat interval while held (ms)
+
 enum MessageType : uint8_t {
   HELLO = 1,
   HELLO_ACK = 2,
   PING = 3,
-  PONG = 4
+  PONG = 4,
+  BUTTON_ALERT = 5,
+  BUTTON_ACK = 6
 };
 
 struct __attribute__((packed)) Message {
@@ -110,8 +120,10 @@ const char *typeName(uint8_t type) {
   switch (type) {
     case HELLO: return "HELLO";
     case HELLO_ACK: return "HELLO_ACK";
-    case PING: return "PING";
-    case PONG: return "PONG";
+    case PING: return "DING";
+    case PONG: return "DONG";
+    case BUTTON_ALERT: return "BUTTON_ALERT";
+    case BUTTON_ACK: return "BUTTON_ACK";
     default: return "UNKNOWN";
   }
 }
@@ -356,6 +368,27 @@ void processReceived(const RxEvent &event) {
         );
       }
       break;
+
+    case BUTTON_ALERT:
+      Serial.println();
+      Serial.println("*************************************************");
+      Serial.printf(" 🚨 REMOTE BUTTON PRESSED! Seq: #%lu | RSSI: %d dBm\n",
+        (unsigned long)msg.sequence, event.rssi);
+      Serial.println("*************************************************");
+
+      // Acknowledge the button press back to sender with urgent priority
+      queueMessage(
+        peerMac, BUTTON_ACK,
+        msg.sequence, true
+      );
+      break;
+
+    case BUTTON_ACK:
+      Serial.printf(
+        "✅ REMOTE ACKNOWLEDGED BUTTON! Seq: #%lu | RSSI: %d dBm\n",
+        (unsigned long)msg.sequence, event.rssi
+      );
+      break;
   }
 }
 
@@ -456,6 +489,8 @@ void setup() {
 
   Serial.begin(115200);
   delay(1500);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   Serial.println();
   Serial.println("==========================");
@@ -629,6 +664,46 @@ void loop() {
     queueMessage(
       peerMac, PING, nextSequence
     );
+  }
+
+  // =========================================
+  // Push Button Handling
+  // =========================================
+  bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW); // Active LOW with INPUT_PULLUP
+  static uint32_t lastButtonSend = 0;
+  static bool buttonWasPressed = false;
+
+  if (buttonPressed) {
+    if (!buttonWasPressed) {
+      buttonWasPressed = true;
+      lastButtonSend = now;
+
+      if (peerKnown) {
+        nextSequence++;
+        Serial.printf(
+          "\n>>> BUTTON HELD: Sending ALERT #%lu to %s <<<\n",
+          (unsigned long)nextSequence, macText(peerMac).c_str()
+        );
+        queueMessage(peerMac, BUTTON_ALERT, nextSequence, true);
+      } else {
+        Serial.println(">>> Button pressed, but peer not discovered yet <<<");
+      }
+    } else if (now - lastButtonSend >= BUTTON_SEND_INTERVAL) {
+      lastButtonSend = now;
+      if (peerKnown) {
+        nextSequence++;
+        Serial.printf(
+          ">>> BUTTON HELD: Sending ALERT #%lu <<<\n",
+          (unsigned long)nextSequence
+        );
+        queueMessage(peerMac, BUTTON_ALERT, nextSequence, true);
+      }
+    }
+  } else {
+    if (buttonWasPressed) {
+      buttonWasPressed = false;
+      Serial.println(">>> Button released <<<\n");
+    }
   }
 
   processTransmitter();
