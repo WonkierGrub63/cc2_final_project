@@ -26,12 +26,13 @@ const uint8_t BROADCAST[6] = {
 constexpr uint32_t MAGIC = 0x45535034;
 
 // =========================================
-// Push Button Configuration
-// Connect an external momentary push button between GPIO 4 and GND.
-// (Uses internal pull-up resistor, no external resistor required)
+// Hardware Configuration
 // =========================================
-constexpr uint8_t BUTTON_PIN = 4;
-constexpr uint32_t BUTTON_SEND_INTERVAL = 500; // Repeat interval while held (ms)
+constexpr uint8_t BUTTON_PIN = 4; // GPIO 4 to Push Button to GND
+constexpr uint8_t BUZZER_PIN = 5; // GPIO 5 to Buzzer (+) / Signal
+constexpr bool PASSIVE_BUZZER = false; // Set to true if using a passive piezo buzzer (PWM)
+constexpr uint32_t BUTTON_SEND_INTERVAL = 300; // Repeat interval while held (ms)
+constexpr uint32_t BUZZER_TIMEOUT = 600; // Fail-safe shutoff if no alert packet received (ms)
 
 enum MessageType : uint8_t {
   HELLO = 1,
@@ -39,7 +40,8 @@ enum MessageType : uint8_t {
   PING = 3,
   PONG = 4,
   BUTTON_ALERT = 5,
-  BUTTON_ACK = 6
+  BUTTON_ACK = 6,
+  BUTTON_RELEASE = 7
 };
 
 struct __attribute__((packed)) Message {
@@ -101,6 +103,26 @@ uint32_t macFailures = 0;
 bool txBusy = false;
 uint32_t lastTxFinished = 0;
 
+// Buzzer state
+bool buzzerIsOn = false;
+uint32_t buzzerActiveUntil = 0;
+
+void buzzerOn() {
+  if (PASSIVE_BUZZER) {
+    tone(BUZZER_PIN, 2000); // 2 kHz tone for passive piezo
+  } else {
+    digitalWrite(BUZZER_PIN, HIGH);
+  }
+}
+
+void buzzerOff() {
+  if (PASSIVE_BUZZER) {
+    noTone(BUZZER_PIN);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
 // =========================================
 // Utilities
 // =========================================
@@ -124,6 +146,7 @@ const char *typeName(uint8_t type) {
     case PONG: return "DONG";
     case BUTTON_ALERT: return "BUTTON_ALERT";
     case BUTTON_ACK: return "BUTTON_ACK";
+    case BUTTON_RELEASE: return "BUTTON_RELEASE";
     default: return "UNKNOWN";
   }
 }
@@ -370,11 +393,16 @@ void processReceived(const RxEvent &event) {
       break;
 
     case BUTTON_ALERT:
-      Serial.println();
-      Serial.println("*************************************************");
-      Serial.printf(" 🚨 REMOTE BUTTON PRESSED! Seq: #%lu | RSSI: %d dBm\n",
-        (unsigned long)msg.sequence, event.rssi);
-      Serial.println("*************************************************");
+      buzzerActiveUntil = millis() + BUZZER_TIMEOUT;
+      if (!buzzerIsOn) {
+        buzzerIsOn = true;
+        buzzerOn();
+        Serial.println();
+        Serial.println("*************************************************");
+        Serial.printf(" 🚨 REMOTE BUTTON PRESSED! BUZZER ON | Seq: #%lu | RSSI: %d dBm\n",
+          (unsigned long)msg.sequence, event.rssi);
+        Serial.println("*************************************************");
+      }
 
       // Acknowledge the button press back to sender with urgent priority
       queueMessage(
@@ -388,6 +416,14 @@ void processReceived(const RxEvent &event) {
         "✅ REMOTE ACKNOWLEDGED BUTTON! Seq: #%lu | RSSI: %d dBm\n",
         (unsigned long)msg.sequence, event.rssi
       );
+      break;
+
+    case BUTTON_RELEASE:
+      if (buzzerIsOn) {
+        buzzerIsOn = false;
+        buzzerOff();
+        Serial.println("🔔 Remote button released -> BUZZER OFF");
+      }
       break;
   }
 }
@@ -491,6 +527,8 @@ void setup() {
   delay(1500);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzerOff();
 
   Serial.println();
   Serial.println("==========================");
@@ -703,7 +741,17 @@ void loop() {
     if (buttonWasPressed) {
       buttonWasPressed = false;
       Serial.println(">>> Button released <<<\n");
+      if (peerKnown) {
+        queueMessage(peerMac, BUTTON_RELEASE, 0, true);
+      }
     }
+  }
+
+  // Fail-safe buzzer auto shutoff if remote stops transmitting
+  if (buzzerIsOn && now >= buzzerActiveUntil) {
+    buzzerIsOn = false;
+    buzzerOff();
+    Serial.println("🔔 Buzzer auto-timeout -> BUZZER OFF");
   }
 
   processTransmitter();
