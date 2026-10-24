@@ -53,11 +53,11 @@ def reader_thread(port_path, node_name, color):
                     if not line:
                         continue
 
-                    # Highlight alerts and acknowledgments
+                    # Highlight alerts, alarms, and acknowledgments
                     extra_style = ""
-                    if "ALERT" in line or "BUTTON PRESSED" in line:
+                    if "ALERT" in line or "BUTTON PRESSED" in line or "ALARM TRIGGERED" in line:
                         extra_style = f"{BOLD}{RED}"
-                    elif "ACK" in line or "ACKNOWLEDGED" in line:
+                    elif "ACK" in line or "ACKNOWLEDGED" in line or "CANCELLED" in line or "CONFIRMED" in line:
                         extra_style = f"{BOLD}{GREEN}"
 
                     with print_lock:

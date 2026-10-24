@@ -28,20 +28,20 @@ constexpr uint32_t MAGIC = 0x45535034;
 // =========================================
 // Hardware Configuration
 // =========================================
-constexpr uint8_t BUTTON_PIN = 4; // GPIO 4 to Push Button to GND
-constexpr uint8_t BUZZER_PIN = 5; // GPIO 5 to Buzzer (+) / Signal
+constexpr uint8_t BUTTON1_PIN = 4; // Button 1: Cancel / Silence Alarm (to GND)
+constexpr uint8_t BUZZER_PIN  = 5; // Buzzer: GPIO 5 (+) / Signal
+constexpr uint8_t BUTTON2_PIN = 6; // Button 2: Trigger Alarm (to GND)
+constexpr uint8_t BOOT_BUTTON_PIN = 0; // Onboard BOOT button (also triggers alarm)
 constexpr bool PASSIVE_BUZZER = false; // Set to true if using a passive piezo buzzer (PWM)
-constexpr uint32_t BUTTON_SEND_INTERVAL = 300; // Repeat interval while held (ms)
-constexpr uint32_t BUZZER_TIMEOUT = 600; // Fail-safe shutoff if no alert packet received (ms)
 
 enum MessageType : uint8_t {
   HELLO = 1,
   HELLO_ACK = 2,
   PING = 3,
   PONG = 4,
-  BUTTON_ALERT = 5,
-  BUTTON_ACK = 6,
-  BUTTON_RELEASE = 7
+  ALARM_TRIGGER = 5,
+  ALARM_CANCEL = 6,
+  ALARM_CANCEL_ACK = 7
 };
 
 struct __attribute__((packed)) Message {
@@ -103,9 +103,8 @@ uint32_t macFailures = 0;
 bool txBusy = false;
 uint32_t lastTxFinished = 0;
 
-// Buzzer state
-bool buzzerIsOn = false;
-uint32_t buzzerActiveUntil = 0;
+// Alarm & Buzzer state
+bool alarmActive = false;
 
 void buzzerOn() {
   if (PASSIVE_BUZZER) {
@@ -144,9 +143,9 @@ const char *typeName(uint8_t type) {
     case HELLO_ACK: return "HELLO_ACK";
     case PING: return "DING";
     case PONG: return "DONG";
-    case BUTTON_ALERT: return "BUTTON_ALERT";
-    case BUTTON_ACK: return "BUTTON_ACK";
-    case BUTTON_RELEASE: return "BUTTON_RELEASE";
+    case ALARM_TRIGGER: return "ALARM_TRIGGER";
+    case ALARM_CANCEL: return "ALARM_CANCEL";
+    case ALARM_CANCEL_ACK: return "ALARM_CANCEL_ACK";
     default: return "UNKNOWN";
   }
 }
@@ -392,38 +391,37 @@ void processReceived(const RxEvent &event) {
       }
       break;
 
-    case BUTTON_ALERT:
-      buzzerActiveUntil = millis() + BUZZER_TIMEOUT;
-      if (!buzzerIsOn) {
-        buzzerIsOn = true;
-        buzzerOn();
+    case ALARM_TRIGGER:
+      Serial.println();
+      Serial.println("*************************************************");
+      Serial.printf(" 🚨 REMOTE ALARM TRIGGERED! Peer: %s | RSSI: %d dBm\n",
+        macText(event.mac).c_str(), event.rssi);
+      Serial.println(" 👉 Press Button 1 (GPIO 4) to cancel remote alarm!");
+      Serial.println("*************************************************");
+      break;
+
+    case ALARM_CANCEL:
+      if (alarmActive) {
+        alarmActive = false;
+        buzzerOff();
         Serial.println();
         Serial.println("*************************************************");
-        Serial.printf(" 🚨 REMOTE BUTTON PRESSED! BUZZER ON | Seq: #%lu | RSSI: %d dBm\n",
-          (unsigned long)msg.sequence, event.rssi);
+        Serial.printf(" ✅ ALARM CANCELLED BY REMOTE NODE (%s)!\n", macText(event.mac).c_str());
+        Serial.println(" 🔇 Buzzer turned OFF.");
         Serial.println("*************************************************");
+      } else {
+        Serial.println("ℹ️ Received ALARM_CANCEL, but alarm was not active.");
       }
 
-      // Acknowledge the button press back to sender with urgent priority
-      queueMessage(
-        peerMac, BUTTON_ACK,
-        msg.sequence, true
-      );
+      // Send ACK back to the remote cancelling node
+      queueMessage(peerMac, ALARM_CANCEL_ACK, msg.sequence, true);
       break;
 
-    case BUTTON_ACK:
-      Serial.printf(
-        "✅ REMOTE ACKNOWLEDGED BUTTON! Seq: #%lu | RSSI: %d dBm\n",
-        (unsigned long)msg.sequence, event.rssi
-      );
-      break;
-
-    case BUTTON_RELEASE:
-      if (buzzerIsOn) {
-        buzzerIsOn = false;
-        buzzerOff();
-        Serial.println("🔔 Remote button released -> BUZZER OFF");
-      }
+    case ALARM_CANCEL_ACK:
+      Serial.println();
+      Serial.println("*************************************************");
+      Serial.println(" ✅ REMOTE CONFIRMED: Alarm cancelled & buzzer OFF!");
+      Serial.println("*************************************************");
       break;
   }
 }
@@ -526,7 +524,9 @@ void setup() {
   Serial.begin(115200);
   delay(1500);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUTTON1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON2_PIN, INPUT_PULLUP);
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   pinMode(BUZZER_PIN, OUTPUT);
   buzzerOff();
 
@@ -705,53 +705,65 @@ void loop() {
   }
 
   // =========================================
-  // Push Button Handling
+  // Button 2: Trigger Alarm (Single Press)
+  // GPIO 6 (external button to GND) or GPIO 0 (onboard BOOT button)
   // =========================================
-  bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW); // Active LOW with INPUT_PULLUP
-  static uint32_t lastButtonSend = 0;
-  static bool buttonWasPressed = false;
+  bool b2State = (digitalRead(BUTTON2_PIN) == LOW) || (digitalRead(BOOT_BUTTON_PIN) == LOW);
+  static bool b2LastState = false;
+  static uint32_t b2DebounceTime = 0;
 
-  if (buttonPressed) {
-    if (!buttonWasPressed) {
-      buttonWasPressed = true;
-      lastButtonSend = now;
+  if (b2State && !b2LastState && (now - b2DebounceTime > 200)) {
+    b2DebounceTime = now;
+    b2LastState = true;
 
-      if (peerKnown) {
-        nextSequence++;
-        Serial.printf(
-          "\n>>> BUTTON HELD: Sending ALERT #%lu to %s <<<\n",
-          (unsigned long)nextSequence, macText(peerMac).c_str()
-        );
-        queueMessage(peerMac, BUTTON_ALERT, nextSequence, true);
-      } else {
-        Serial.println(">>> Button pressed, but peer not discovered yet <<<");
-      }
-    } else if (now - lastButtonSend >= BUTTON_SEND_INTERVAL) {
-      lastButtonSend = now;
-      if (peerKnown) {
-        nextSequence++;
-        Serial.printf(
-          ">>> BUTTON HELD: Sending ALERT #%lu <<<\n",
-          (unsigned long)nextSequence
-        );
-        queueMessage(peerMac, BUTTON_ALERT, nextSequence, true);
-      }
+    alarmActive = true;
+    buzzerOn();
+
+    Serial.println();
+    Serial.println("*************************************************");
+    Serial.println(" 🚨 LOCAL ALARM TRIGGERED! Buzzer sounding continuously!");
+    Serial.println(" 👉 Press Button 1 (GPIO 4) on remote node to cancel.");
+    Serial.println("*************************************************");
+
+    if (peerKnown) {
+      nextSequence++;
+      queueMessage(peerMac, ALARM_TRIGGER, nextSequence, true);
+    } else {
+      Serial.println("Notice: Alarm active locally (peer not yet discovered).");
     }
-  } else {
-    if (buttonWasPressed) {
-      buttonWasPressed = false;
-      Serial.println(">>> Button released <<<\n");
-      if (peerKnown) {
-        queueMessage(peerMac, BUTTON_RELEASE, 0, true);
-      }
-    }
+  } else if (!b2State && b2LastState && (now - b2DebounceTime > 50)) {
+    b2LastState = false;
   }
 
-  // Fail-safe buzzer auto shutoff if remote stops transmitting
-  if (buzzerIsOn && now >= buzzerActiveUntil) {
-    buzzerIsOn = false;
-    buzzerOff();
-    Serial.println("🔔 Buzzer auto-timeout -> BUZZER OFF");
+  // =========================================
+  // Button 1: Cancel Alarm (Single Press)
+  // GPIO 4 (external button to GND)
+  // =========================================
+  bool b1State = (digitalRead(BUTTON1_PIN) == LOW);
+  static bool b1LastState = false;
+  static uint32_t b1DebounceTime = 0;
+
+  if (b1State && !b1LastState && (now - b1DebounceTime > 200)) {
+    b1DebounceTime = now;
+    b1LastState = true;
+
+    Serial.println("\n>>> Button 1 pressed: Sending ALARM_CANCEL to remote node... <<<");
+
+    if (alarmActive) {
+      // Also silence local buzzer if active
+      alarmActive = false;
+      buzzerOff();
+      Serial.println("🔇 Local buzzer turned OFF.");
+    }
+
+    if (peerKnown) {
+      nextSequence++;
+      queueMessage(peerMac, ALARM_CANCEL, nextSequence, true);
+    } else {
+      Serial.println("Notice: Peer not discovered yet.");
+    }
+  } else if (!b1State && b1LastState && (now - b1DebounceTime > 50)) {
+    b1LastState = false;
   }
 
   processTransmitter();
