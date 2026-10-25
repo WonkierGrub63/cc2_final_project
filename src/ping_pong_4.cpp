@@ -3,6 +3,51 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_idf_version.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// =========================================
+// Dual Serial Support (Native USB + UART port)
+// Ensures debugging & serial commands work
+// regardless of which USB-C port is plugged in.
+// =========================================
+class DualPortSerial : public Stream {
+public:
+  void begin(unsigned long baud) {
+    ::Serial.begin(baud);
+    Serial0.begin(baud);
+  }
+  int available() override {
+    return (::Serial ? ::Serial.available() : 0) + Serial0.available();
+  }
+  int read() override {
+    if (::Serial && ::Serial.available()) return ::Serial.read();
+    if (Serial0.available()) return Serial0.read();
+    return -1;
+  }
+  int peek() override {
+    if (::Serial && ::Serial.available()) return ::Serial.peek();
+    if (Serial0.available()) return Serial0.peek();
+    return -1;
+  }
+  void flush() override {
+    if (::Serial) ::Serial.flush();
+    Serial0.flush();
+  }
+  size_t write(uint8_t c) override {
+    if (::Serial) ::Serial.write(c);
+    Serial0.write(c);
+    return 1;
+  }
+  size_t write(const uint8_t *buffer, size_t size) override {
+    if (::Serial) ::Serial.write(buffer, size);
+    Serial0.write(buffer, size);
+    return size;
+  }
+};
+
+static DualPortSerial DualSerial;
+#define Serial DualSerial
 
 // =========================================
 // ESP-NOW v4 - Two node reliability test
@@ -33,6 +78,12 @@ constexpr uint8_t BUZZER_PIN  = 5; // Buzzer: GPIO 5 (+) / Signal
 constexpr uint8_t BUTTON2_PIN = 6; // Button 2: Trigger Alarm (to GND)
 constexpr uint8_t BOOT_BUTTON_PIN = 0; // Onboard BOOT button (also triggers alarm)
 constexpr bool PASSIVE_BUZZER = false; // Set to true if using a passive piezo buzzer (PWM)
+
+// I2C 16x2 / 20x4 LCD Configuration
+constexpr uint8_t LCD_SDA_PIN = 8; // I2C SDA -> LCD SDA pin
+constexpr uint8_t LCD_SCL_PIN = 9; // I2C SCL -> LCD SCL pin
+constexpr uint8_t LCD_COLS = 16;
+constexpr uint8_t LCD_ROWS = 2;
 
 enum MessageType : uint8_t {
   HELLO = 1,
@@ -120,6 +171,53 @@ void buzzerOff() {
   } else {
     digitalWrite(BUZZER_PIN, LOW);
   }
+}
+
+// LCD & Mesh Telemetry state
+LiquidCrystal_I2C lcd(0x27, LCD_COLS, LCD_ROWS);
+bool lcdAvailable = false;
+int8_t lastRssi = 0;
+uint32_t lastRtt = 0;
+bool remoteAlarmActive = false;
+
+void updateLcdStatus(bool force = false) {
+  if (!lcdAvailable) return;
+
+  static uint32_t lastUpdate = 0;
+  uint32_t now = millis();
+  if (!force && (now - lastUpdate < 500)) return;
+  lastUpdate = now;
+
+  char line1[17];
+  char line2[17];
+
+  if (alarmActive) {
+    snprintf(line1, sizeof(line1), "** ALARM ON! ** ");
+    snprintf(line2, sizeof(line2), "BUZZER! B1:Stop ");
+  } else if (remoteAlarmActive) {
+    snprintf(line1, sizeof(line1), "!REMOTE ALARM!  ");
+    snprintf(line2, sizeof(line2), "Press B1:Cancel ");
+  } else if (!peerKnown) {
+    snprintf(line1, sizeof(line1), "MESH: SEARCHING ");
+    snprintf(line2, sizeof(line2), "CH:%u ID:%02X%02X%02X ",
+      CHANNEL, myMac[3], myMac[4], myMac[5]);
+  } else if (!peerHealthy) {
+    snprintf(line1, sizeof(line1), "MESH: OFFLINE!  ");
+    snprintf(line2, sizeof(line2), "PEER UNHEALTHY  ");
+  } else {
+    // Normal healthy mesh status
+    snprintf(line1, sizeof(line1), "MESH:OK %+3ddBm ", lastRssi);
+    snprintf(line2, sizeof(line2), "RTT:%lums P:%-5lu",
+      (unsigned long)lastRtt, (unsigned long)pingOK);
+  }
+
+  line1[16] = '\0';
+  line2[16] = '\0';
+
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
 }
 
 // =========================================
@@ -215,6 +313,83 @@ bool queueMessage(
   }
 
   return true;
+}
+
+// =========================================
+// Alarm Management & Serial (Raspberry Pi) API
+// =========================================
+
+void triggerLocalAlarm(const char *source) {
+  if (!alarmActive) {
+    alarmActive = true;
+    buzzerOn();
+    updateLcdStatus(true);
+
+    Serial.println();
+    Serial.println("EVENT:ALARM_STARTED");
+    Serial.println("*************************************************");
+    Serial.printf(" 🚨 LOCAL ALARM TRIGGERED (%s)! Buzzer ON!\n", source);
+    Serial.println(" 👉 Press Button 1 (GPIO 4) on remote node to cancel.");
+    Serial.println("*************************************************");
+
+    if (peerKnown) {
+      nextSequence++;
+      queueMessage(peerMac, ALARM_TRIGGER, nextSequence, true);
+    } else {
+      Serial.println("Notice: Alarm active locally (peer not yet discovered).");
+    }
+  }
+}
+
+void cancelLocalAlarm(const char *source) {
+  if (alarmActive) {
+    alarmActive = false;
+    buzzerOff();
+    updateLcdStatus(true);
+
+    Serial.println();
+    Serial.println("EVENT:ALARM_CANCELLED_LOCAL");
+    Serial.println("*************************************************");
+    Serial.printf(" 🔇 Local alarm silenced (%s).\n", source);
+    Serial.println("*************************************************");
+  }
+}
+
+void handleSerialCommand(const char *cmd) {
+  if (strcmp(cmd, "ALARM_ON") == 0 || strcmp(cmd, "START_ALARM") == 0 || strcmp(cmd, "TRIGGER") == 0) {
+    triggerLocalAlarm("Raspberry Pi USB command");
+  } else if (strcmp(cmd, "ALARM_OFF") == 0 || strcmp(cmd, "STOP_ALARM") == 0 || strcmp(cmd, "CANCEL") == 0) {
+    cancelLocalAlarm("Raspberry Pi USB command");
+    if (peerKnown) {
+      nextSequence++;
+      queueMessage(peerMac, ALARM_CANCEL, nextSequence, true);
+    }
+  } else if (strcmp(cmd, "PING") == 0) {
+    Serial.println("PONG:ESP32_OK");
+  } else if (strcmp(cmd, "STATUS") == 0) {
+    Serial.printf("STATUS:ALARM=%s,PEER=%s\n",
+      alarmActive ? "ACTIVE" : "IDLE",
+      peerKnown ? "CONNECTED" : "DISCONNECTED"
+    );
+  }
+}
+
+void processSerialInput() {
+  static char serialBuf[64];
+  static uint8_t bufIdx = 0;
+
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (bufIdx > 0) {
+        serialBuf[bufIdx] = '\0';
+        handleSerialCommand(serialBuf);
+        bufIdx = 0;
+      }
+    } else if (bufIdx < sizeof(serialBuf) - 1) {
+      serialBuf[bufIdx++] = c;
+    }
+  }
 }
 
 // =========================================
@@ -345,6 +520,7 @@ void processReceived(const RxEvent &event) {
       break;
 
     case PING:
+      lastRssi = event.rssi;
       Serial.printf(
         "RX PING #%lu | RSSI %d dBm\n",
         (unsigned long)msg.sequence,
@@ -371,6 +547,8 @@ void processReceived(const RxEvent &event) {
         awaitingPong = false;
         lastPong = millis();
         pingOK++;
+        lastRtt = rtt;
+        lastRssi = event.rssi;
 
         if (!peerHealthy) {
           peerHealthy = true;
@@ -392,6 +570,8 @@ void processReceived(const RxEvent &event) {
       break;
 
     case ALARM_TRIGGER:
+      remoteAlarmActive = true;
+      updateLcdStatus(true);
       Serial.println();
       Serial.println("*************************************************");
       Serial.printf(" 🚨 REMOTE ALARM TRIGGERED! Peer: %s | RSSI: %d dBm\n",
@@ -401,10 +581,12 @@ void processReceived(const RxEvent &event) {
       break;
 
     case ALARM_CANCEL:
+      remoteAlarmActive = false;
       if (alarmActive) {
         alarmActive = false;
         buzzerOff();
         Serial.println();
+        Serial.println("EVENT:ALARM_CANCELLED");
         Serial.println("*************************************************");
         Serial.printf(" ✅ ALARM CANCELLED BY REMOTE NODE (%s)!\n", macText(event.mac).c_str());
         Serial.println(" 🔇 Buzzer turned OFF.");
@@ -412,12 +594,15 @@ void processReceived(const RxEvent &event) {
       } else {
         Serial.println("ℹ️ Received ALARM_CANCEL, but alarm was not active.");
       }
+      updateLcdStatus(true);
 
       // Send ACK back to the remote cancelling node
       queueMessage(peerMac, ALARM_CANCEL_ACK, msg.sequence, true);
       break;
 
     case ALARM_CANCEL_ACK:
+      remoteAlarmActive = false;
+      updateLcdStatus(true);
       Serial.println();
       Serial.println("*************************************************");
       Serial.println(" ✅ REMOTE CONFIRMED: Alarm cancelled & buzzer OFF!");
@@ -523,12 +708,49 @@ void setup() {
 
   Serial.begin(115200);
   delay(1500);
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println(" ESP32-S3 BOOTING - INITIALIZING HARDWARE");
+  Serial.println("========================================");
+  Serial.flush();
 
   pinMode(BUTTON1_PIN, INPUT_PULLUP);
   pinMode(BUTTON2_PIN, INPUT_PULLUP);
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   pinMode(BUZZER_PIN, OUTPUT);
   buzzerOff();
+
+  // Initialize I2C for LCD
+  Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN);
+  Wire.setTimeOut(50); // Prevent hanging if I2C bus is held low or unpowered
+  delay(100);
+
+  // Auto-detect PCF8574 address: 0x27 or 0x3F
+  uint8_t lcdAddr = 0;
+  Wire.beginTransmission(0x27);
+  if (Wire.endTransmission() == 0) {
+    lcdAddr = 0x27;
+  } else {
+    Wire.beginTransmission(0x3F);
+    if (Wire.endTransmission() == 0) {
+      lcdAddr = 0x3F;
+    }
+  }
+
+  if (lcdAddr != 0) {
+    lcd = LiquidCrystal_I2C(lcdAddr, LCD_COLS, LCD_ROWS);
+    lcd.init();
+    lcd.backlight();
+    lcdAvailable = true;
+    Serial.printf("LCD initialized at I2C 0x%02X\n", lcdAddr);
+
+    lcd.setCursor(0, 0);
+    lcd.print("ESP-NOW MESH v4 ");
+    lcd.setCursor(0, 1);
+    lcd.print("STARTING...     ");
+  } else {
+    Serial.println("Notice: No I2C LCD detected at 0x27 or 0x3F (running without LCD)");
+  }
 
   Serial.println();
   Serial.println("==========================");
@@ -705,6 +927,11 @@ void loop() {
   }
 
   // =========================================
+  // Process Serial Commands from Raspberry Pi
+  // =========================================
+  processSerialInput();
+
+  // =========================================
   // Button 2: Trigger Alarm (Single Press)
   // GPIO 6 (external button to GND) or GPIO 0 (onboard BOOT button)
   // =========================================
@@ -715,22 +942,7 @@ void loop() {
   if (b2State && !b2LastState && (now - b2DebounceTime > 200)) {
     b2DebounceTime = now;
     b2LastState = true;
-
-    alarmActive = true;
-    buzzerOn();
-
-    Serial.println();
-    Serial.println("*************************************************");
-    Serial.println(" 🚨 LOCAL ALARM TRIGGERED! Buzzer sounding continuously!");
-    Serial.println(" 👉 Press Button 1 (GPIO 4) on remote node to cancel.");
-    Serial.println("*************************************************");
-
-    if (peerKnown) {
-      nextSequence++;
-      queueMessage(peerMac, ALARM_TRIGGER, nextSequence, true);
-    } else {
-      Serial.println("Notice: Alarm active locally (peer not yet discovered).");
-    }
+    triggerLocalAlarm("Button 2");
   } else if (!b2State && b2LastState && (now - b2DebounceTime > 50)) {
     b2LastState = false;
   }
@@ -748,13 +960,7 @@ void loop() {
     b1LastState = true;
 
     Serial.println("\n>>> Button 1 pressed: Sending ALARM_CANCEL to remote node... <<<");
-
-    if (alarmActive) {
-      // Also silence local buzzer if active
-      alarmActive = false;
-      buzzerOff();
-      Serial.println("🔇 Local buzzer turned OFF.");
-    }
+    cancelLocalAlarm("Button 1");
 
     if (peerKnown) {
       nextSequence++;
@@ -767,6 +973,11 @@ void loop() {
   }
 
   processTransmitter();
+
+  // =========================================
+  // Update 16x2 I2C LCD Status Display
+  // =========================================
+  updateLcdStatus();
 
   delay(2);
 }
